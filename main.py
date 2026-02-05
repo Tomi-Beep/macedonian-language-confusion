@@ -18,6 +18,9 @@ MAX_TOKENS = 80
 SEED = 42
 random.seed(SEED)
 
+translator = GoogleTranslator(source="mk", target="en")
+
+
 def normalize_spaces(text):
     return re.sub(r"\s+", " ", text).strip()
 
@@ -45,34 +48,63 @@ def is_clean_mk(ft, text):
 
 
 # randomised loadiranje od dataset
-def load_qa_pairs(n):
-    ds = load_dataset(DATASET)["train"]
-
-    idxs = list(range(len(ds)))
+def load_qa_pairs_split(ds_split, n):
+    idxs = list(range(len(ds_split)))
     random.shuffle(idxs)
 
     pairs = []
     for i in idxs:
-        q = ds[i]["question"].strip()
-        answers = ds[i]["answer"]
+        q = (ds_split[i].get("question") or "").strip()
+        answers = ds_split[i].get("answer") or []
         a = answers[0].strip() if answers else ""
 
-        pairs.append((q, a))
+        if q:
+            pairs.append((q, a))
+
         if len(pairs) >= n:
             break
 
     return pairs
 
-translator = GoogleTranslator(source="mk", target="en")
 
-def mix_text(text, how_many=2):
-    mk = text.split()
-    en = translator.translate(text).split()
+def load_fewshot_and_test(num_fewshot, num_trials):
+    """
+    Load few-shot examples from train, and test pool from test.
+    If no test split exists, fallback to train (but then we avoid overlap by sampling disjoint sets).
+    """
+    ds = load_dataset(DATASET)
 
-    n = min(how_many, len(mk), len(en))
-    for i in range(n):
-        mk[i] = en[i]
-    return " ".join(mk)
+    train_split = ds["train"]
+
+    if "test" in ds:
+        test_split = ds["test"]
+        fewshot_examples = load_qa_pairs_split(train_split, num_fewshot)
+        test_pool = load_qa_pairs_split(test_split, num_trials)
+        return fewshot_examples, test_pool
+
+    # Fallback: no test split available.
+    # Sample disjointly from train: first few-shot then test from remaining.
+    all_train = load_qa_pairs_split(train_split, num_fewshot + num_trials)
+    fewshot_examples = all_train[:num_fewshot]
+    test_pool = all_train[num_fewshot:num_fewshot + num_trials]
+    return fewshot_examples, test_pool
+
+
+def mix_text(text: str, how_many: int = 2):
+    mk_tokens = text.split()
+    en_tokens = translator.translate(text).split()
+
+    if not mk_tokens or not en_tokens:
+        return text
+
+    n = min(how_many, len(mk_tokens), len(en_tokens))
+    idxs = list(range(min(len(mk_tokens), len(en_tokens))))
+    random.shuffle(idxs)
+    chosen = idxs[:n]
+
+    for i in chosen:
+        mk_tokens[i] = en_tokens[i]
+    return " ".join(mk_tokens)
 
 
 # prompts
@@ -93,29 +125,30 @@ def prompt_baseline(q):
 
 
 def prompt_fewshot(q, examples):
-    block = ""
+    msgs = [{"role": "system", "content": system_prompt()}]
     for ex_q, ex_a in examples:
-        block += f"Прашање: {ex_q}\nОдговор: {ex_a}\n\n"
-    user = block + f"Прашање: {q}\nОдговор:"
-    return [
-        {"role": "system", "content": system_prompt()},
-        {"role": "user", "content": user}
-    ]
+        msgs.append({"role": "user", "content": f"Прањаше: {ex_q}"})
+        msgs.append({"role": "assistant", "content": f"{ex_a}"})
+    msgs.append({"role": "user", "content": f"Прашање: {q}\nОдговори со една јасна реченица."})
+    return msgs
 
 
-def prompt_icm(q, examples, how_many=2):
-    block = ""
+def prompt_icm(q: str, examples, how_many: int = 2):
+    msgs = [{"role": "system", "content": system_prompt()}, {
+        "role": "user",
+        "content": (
+            "Примерите подолу содржат мешани зборови, но твојот одговор МОРА да биде чисто на македонски (кирилица), без латиница и без англиски зборови. Одговори со една јасна реченица."
+        )
+    }]
+
     for ex_q, ex_a in examples:
-        block += f"Прашање: {mix_text(ex_q, how_many)}\nОдговор: {mix_text(ex_a, how_many)}\n\n"
-    user = (
-            "Примерите имаат мешани зборови, ама ти одговори чисто на македонски (кирилица):\n\n"
-            + block
-            + f"Прашање: {q}\nОдговор:"
-    )
-    return [
-        {"role": "system", "content": system_prompt()},
-        {"role": "user", "content": user}
-    ]
+        mixed_q = mix_text(ex_q, how_many=how_many)
+        mixed_a = mix_text(ex_a, how_many=how_many)
+        msgs.append({"role": "user", "content": f"Прашање: {mixed_q}"})
+        msgs.append({"role": "assistant", "content": f"{mixed_a}"})
+
+    msgs.append({"role": "user", "content": f"Прашање: {q}\nОдговори со една јасна реченица."})
+    return msgs
 
 
 def prompt_echo():
@@ -131,17 +164,15 @@ def ask_ollama(messages, temperature, top_p):
     resp = ollama.chat(
         model=MODEL,
         messages=messages,
-        options={"temperature": temperature, "top_p": top_p, "num_predict": MAX_TOKENS}
+        options={"temperature": temperature, "top_p": top_p, "num_                                                                                                                                                                                  predict": MAX_TOKENS}
     )
     return resp["message"]["content"]
 
 
 def run():
     print("Loading data...")
-    qa = load_qa_pairs(NUM_TRIALS + NUM_FEWSHOT)
-
-    fewshot_examples = qa[:NUM_FEWSHOT]
-    test_pool = qa[NUM_FEWSHOT:NUM_FEWSHOT + NUM_TRIALS]
+    print("Loading data...")
+    fewshot_examples, test_pool = load_fewshot_and_test(NUM_FEWSHOT, NUM_TRIALS)
 
     print("Loading fastText...")
     ft = load_fasttext_model(FASTTEXT_LID_PATH)
