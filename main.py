@@ -164,7 +164,7 @@ def ask_ollama(messages, temperature, top_p):
     resp = ollama.chat(
         model=MODEL,
         messages=messages,
-        options={"temperature": temperature, "top_p": top_p, "num_                                                                                                                                                                                  predict": MAX_TOKENS}
+        options={"temperature": temperature, "top_p": top_p, "num_predict": MAX_TOKENS}
     )
     return resp["message"]["content"]
 
